@@ -1,0 +1,269 @@
+use cozy_chess::{BitBoard, Board, Color, GameStatus, Move, Piece};
+
+use crate::nnue::Nnue;
+
+use super::{eval::Evaluation, threats::threats, zobrist::Zobrist};
+
+#[derive(Debug, Clone)]
+pub struct Position {
+    current: Board,
+    w_threats: BitBoard,
+    b_threats: BitBoard,
+    boards: Vec<Board>,
+    threats: Vec<(BitBoard, BitBoard)>,
+    moves: Vec<Option<Move>>,
+    last_eval: usize,
+    evaluator: Nnue,
+    pawn_zobrist: Zobrist,
+}
+
+impl Position {
+    pub fn new(board: Board) -> Self {
+        let mut evaluator = Nnue::new();
+        let (w_threats, b_threats) = threats(&board);
+        evaluator.full_reset(&board, w_threats, b_threats);
+        let w_pawns = board.colored_pieces(Color::White, Piece::Pawn);
+        let b_pawns = board.colored_pieces(Color::Black, Piece::Pawn);
+        Self {
+            current: board,
+            w_threats,
+            b_threats,
+            threats: vec![],
+            boards: vec![],
+            moves: vec![],
+            last_eval: 0,
+            evaluator,
+            pawn_zobrist: Zobrist::new(w_pawns, b_pawns),
+        }
+    }
+
+    /// Clears position history, sets board as current root
+    /// Forces recalculation of NNUE accumulators and threats
+    pub fn set_board(&mut self, board: Board) {
+        let (w_threats, b_threats) = threats(&board);
+        self.evaluator.full_reset(&board, w_threats, b_threats);
+        self.w_threats = w_threats;
+        self.b_threats = b_threats;
+        self.current = board;
+        self.boards.clear();
+        self.threats.clear();
+        self.moves.clear();
+        self.pawn_zobrist.clear(
+            self.current.colored_pieces(Color::White, Piece::Pawn),
+            self.current.colored_pieces(Color::Black, Piece::Pawn),
+        );
+        self.last_eval = 0;
+    }
+
+    /// Forces recalculation of NNUE accumulators
+    pub fn reset(&mut self) {
+        self.evaluator
+            .full_reset(&self.current, self.w_threats, self.b_threats);
+        self.last_eval = self.boards.len();
+    }
+
+    /// Returns true for 50 move rule and three fold repetitions
+    ///
+    /// If a two fold repetition occurs with both positions being
+    /// after search root, it's considered a three fold repetition
+    ///
+    /// Returns true if [insufficient material](Self::insufficient_material)
+    pub fn forced_draw(&self, ply: u32) -> bool {
+        if self.insufficient_material()
+            || (self.current.halfmove_clock() >= 100
+                && (self.current.checkers().is_empty() || self.current.status() != GameStatus::Won))
+        {
+            return true;
+        }
+        let hash = self.hash();
+        let two_fold = self
+            .boards
+            .iter()
+            .rev()
+            .take(ply as usize - 1)
+            .any(|board| board.hash() == hash);
+        let three_fold = self
+            .boards
+            .iter()
+            .rev()
+            .skip(ply as usize - 1)
+            .filter(|board| board.hash() == hash)
+            .count()
+            >= 2;
+        two_fold || three_fold
+    }
+
+    /// Current board
+    pub fn board(&self) -> &Board {
+        &self.current
+    }
+
+    /// Attempts to make a null move
+    ///
+    /// Returns false if null move can't be done
+    ///
+    /// Returns true if null move was played
+    pub fn null_move(&mut self) -> bool {
+        let Some(new_board) = self.board().null_move() else {
+            return false;
+        };
+        self.pawn_zobrist.null_move();
+        self.moves.push(None);
+        self.boards.push(self.current.clone());
+        self.threats.push((self.w_threats, self.b_threats));
+        self.current = new_board;
+        true
+    }
+
+    /// See [Position::make_move]
+    /// - Runs post_make after making the move, before updating the neural network
+    pub fn make_move_fetch<F: Fn(&Board)>(&mut self, make_move: Move, post_make: F) {
+        let old_board = self.current.clone();
+        let old_w_threats = self.w_threats;
+        let old_b_threats = self.b_threats;
+
+        let old_w_pawns = old_board.colored_pieces(Color::White, Piece::Pawn);
+        let old_b_pawns = old_board.colored_pieces(Color::Black, Piece::Pawn);
+
+        self.current.play_unchecked(make_move);
+        post_make(&self.current);
+        (self.w_threats, self.b_threats) = threats(&self.current);
+        let w_pawns = self.current.colored_pieces(Color::White, Piece::Pawn);
+        let b_pawns = self.current.colored_pieces(Color::Black, Piece::Pawn);
+        self.pawn_zobrist
+            .make_move(old_w_pawns ^ w_pawns, old_b_pawns ^ b_pawns);
+        self.moves.push(Some(make_move));
+        self.boards.push(old_board);
+        self.threats.push((old_w_threats, old_b_threats));
+    }
+
+    fn update_nnue(&mut self) {
+        while self.last_eval + 1 < self.boards.len() {
+            let idx = self.last_eval;
+            self.last_eval += 1;
+            let Some(last_mv) = self.moves[idx] else {
+                self.evaluator.null_move();
+                continue;
+            };
+            let (old_w_threats, old_b_threats) = self.threats[idx];
+            let (w_threats, b_threats) = self.threats[idx + 1];
+            self.evaluator.make_move(
+                &self.boards[idx],
+                &self.boards[idx + 1],
+                last_mv,
+                w_threats,
+                b_threats,
+                old_w_threats,
+                old_b_threats,
+            );
+        }
+        if self.last_eval == self.boards.len() {
+            return;
+        }
+        assert!(self.last_eval + 1 == self.boards.len());
+        let idx = self.last_eval;
+        self.last_eval = self.boards.len();
+        let Some(last_mv) = self.moves[idx] else {
+            self.evaluator.null_move();
+            return;
+        };
+        let (old_w_threats, old_b_threats) = self.threats[idx];
+        self.evaluator.make_move(
+            &self.boards[idx],
+            &self.current,
+            last_mv,
+            self.w_threats,
+            self.b_threats,
+            old_w_threats,
+            old_b_threats,
+        );
+    }
+
+    /// Makes move, updates accumulators and calculates threats
+    /// - Expensive function, only use if the move is going to be searched
+    pub fn make_move(&mut self, make_move: Move) {
+        self.make_move_fetch(make_move, |_| {});
+    }
+
+    /// Takes back one (move)[Self::make_move]
+    pub fn unmake_move(&mut self) {
+        self.moves.pop().unwrap();
+        self.pawn_zobrist.unmake_move();
+        let current = self.boards.pop().unwrap();
+        (self.w_threats, self.b_threats) = self.threats.pop().unwrap();
+        self.current = current;
+        while self.last_eval > self.boards.len() {
+            self.evaluator.unmake_move();
+            self.last_eval -= 1;
+        }
+    }
+
+    pub fn hash(&self) -> u64 {
+        self.board().hash()
+    }
+
+    pub fn pawn_hash(&self) -> u16 {
+        self.pawn_zobrist.hash()
+    }
+
+    /// Returns side to move relative threats
+    pub fn threats(&self) -> (BitBoard, BitBoard) {
+        match self.current.side_to_move() {
+            Color::White => (self.w_threats, self.b_threats),
+            Color::Black => (self.b_threats, self.w_threats),
+        }
+    }
+
+    /// Returns aggression value
+    /// - Value may vary depending on position and root evaluation
+    /// - Avoid storing, instead recalculate for a given position
+    pub fn aggression(&self, stm: Color, root_eval: Evaluation) -> i16 {
+        let piece_cnt = self.board().occupied().len() - self.board().pieces(Piece::Pawn).len();
+        let scale = 2 * piece_cnt as i16;
+
+        let clamped_eval = root_eval.raw().clamp(-200, 200);
+        (match self.board().side_to_move() == stm {
+            true => scale * clamped_eval,
+            false => -scale * clamped_eval,
+        }) / 100
+    }
+
+    /// Calculates NN evaluation + FRC bonus
+    /// - Add [aggression](Self::aggression) if using for search results & pruning
+    pub fn get_eval(&mut self) -> Evaluation {
+        self.update_nnue();
+        let piece_cnt = self.board().occupied().len() as i16;
+
+        Evaluation::new(
+            self.evaluator
+                .feed_forward(self.board().side_to_move(), piece_cnt as usize)
+        )
+    }
+
+    /// Handles insufficient material for the following cases:
+    /// - Two kings
+    /// - Two kings and one minor piece
+    pub fn insufficient_material(&self) -> bool {
+        let rooks = self.current.pieces(Piece::Rook);
+        let queens = self.current.pieces(Piece::Queen);
+        let pawns = self.current.pieces(Piece::Pawn);
+        match self.current.occupied().len() {
+            2 => true,
+            3 => (rooks | queens | pawns).is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if a move is capture
+    /// - Excludes en-passant
+    pub fn is_capture(&self, mv: Move) -> bool {
+        let nstm = !self.board().side_to_move();
+        self.board().colors(nstm).has(mv.to)
+    }
+
+    /// Returns true if a move is not a capture or a promotion
+    /// - Counts an en-passant capture as quiet
+    pub fn is_quiet(&self, mv: Move) -> bool {
+        mv.promotion.is_none() && !self.is_capture(mv)
+    }
+}
